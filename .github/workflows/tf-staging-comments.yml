@@ -24,13 +24,13 @@ jobs:
       is_fork: ${{ steps.pr.outputs.is_fork }}
       matrix: ${{ steps.targets.outputs.matrix }}
       actor_ok: ${{ steps.perms.outputs.actor_ok }}
+      error: ${{ steps.targets.outputs.error }}
 
     steps:
       - name: Parse comment
         id: parse
         run: |
           BODY="${{ github.event.comment.body }}"
-          # Normalize whitespace
           BODY="$(echo "$BODY" | tr -s ' ')"
 
           if [[ "$BODY" =~ ^/tf[[:space:]]+plan($|[[:space:]].*) ]]; then
@@ -41,7 +41,6 @@ jobs:
             echo "action=unknown" >> $GITHUB_OUTPUT
           fi
 
-          # optional argument: app name or explicit path
           ARG="$(echo "$BODY" | awk '{print $3}')"
           echo "arg=$ARG" >> $GITHUB_OUTPUT
 
@@ -73,7 +72,7 @@ jobs:
               owner, repo, username: actor
             });
 
-            const level = perm.data.permission; // admin, maintain, write, triage, read, none
+            const level = perm.data.permission;
             const ok = ["admin", "maintain", "write"].includes(level);
             core.setOutput("actor_ok", String(ok));
 
@@ -86,24 +85,20 @@ jobs:
       - name: Compute target roots (staging only)
         id: targets
         run: |
-          ACTION="${{ steps.parse.outputs.action }}"
           ARG="${{ steps.parse.outputs.arg }}"
           BASE_REF="${{ steps.pr.outputs.base_ref }}"
 
-          # Fetch base branch to diff (for /tf plan with no arg)
           git fetch origin "${BASE_REF}:${BASE_REF}" --depth=1 || true
 
           TARGETS=""
 
           if [ -n "$ARG" ]; then
-            # If ARG looks like a path, use it; else treat as <app>
             if [[ "$ARG" == infra/apps/* ]]; then
               CAND="$ARG"
             else
               CAND="infra/apps/$ARG/staging"
             fi
 
-            # Enforce staging only
             if [[ "$CAND" != */staging ]]; then
               echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
               echo "error=Only staging is allowed. Use infra/apps/<app>/staging or '/tf plan <app>'." >> $GITHUB_OUTPUT
@@ -118,8 +113,6 @@ jobs:
 
             TARGETS="$CAND"
           else
-            # No ARG: plan/apply only changed staging roots
-            # Compare base...HEAD
             CHANGED=$(git diff --name-only "${BASE_REF}...HEAD" | grep '^infra/apps/' || true)
 
             ROOTS=$(echo "$CHANGED" \
@@ -138,6 +131,21 @@ jobs:
           JSON=$(echo "$TARGETS" | awk '{print "{\"path\":\""$0"\"}"}' | paste -sd, -)
           echo "matrix={\"include\":[${JSON}]}" >> $GITHUB_OUTPUT
 
+      # Optional: if you want to comment when detection failed / no targets
+      - name: Comment dispatch error (optional)
+        if: ${{ steps.targets.outputs.error != '' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `⚠️ ${process.env.ERR}`
+            });
+        env:
+          ERR: ${{ steps.targets.outputs.error }}
+
   terraform:
     needs: dispatch
     if: ${{ fromJson(needs.dispatch.outputs.matrix).include[0] != null }}
@@ -146,7 +154,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.dispatch.outputs.matrix) }}
 
-    # prevent two applies/plan collisions for same target
     concurrency:
       group: tf-staging-${{ matrix.path }}
       cancel-in-progress: false
@@ -162,8 +169,7 @@ jobs:
         with:
           terraform_version: 1.6.6
 
-      # Recommended: AWS OIDC role for GitHub Actions
-      - name: Configure AWS credentials (OIDC)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -172,7 +178,6 @@ jobs:
 
       - name: Init
         run: |
-          # If your backend.hcl has "profile=...", create backend.ci.hcl without it and use that here.
           terraform -chdir=${{ matrix.path }} init -backend-config=backend.hcl
 
       - name: Validate
@@ -183,12 +188,11 @@ jobs:
       - name: Plan
         if: ${{ needs.dispatch.outputs.action == 'plan' }}
         run: |
-          terraform -chdir=${{ matrix.path }} plan -no-color | tee plan.txt
+          terraform -chdir=${{ matrix.path }} plan -no-color | tee ${{ matrix.path }}/plan.txt
 
       - name: Apply (staging only)
         if: ${{ needs.dispatch.outputs.action == 'apply' }}
         run: |
-          # safety gates
           if [ "${{ needs.dispatch.outputs.is_fork }}" = "true" ]; then
             echo "Refusing apply: PR is from a fork."
             exit 1
@@ -198,9 +202,75 @@ jobs:
             exit 1
           fi
 
-          terraform -chdir=${{ matrix.path }} apply -auto-approve
+          terraform -chdir=${{ matrix.path }} apply -auto-approve -no-color | tee ${{ matrix.path }}/apply.txt
 
-      - name: Comment result on PR
+      # ---- PR COMMENTS: print plan/apply output ----
+
+      - name: Comment plan output on PR
+        if: ${{ needs.dispatch.outputs.action == 'plan' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const prNumber = context.payload.issue.number;
+            const path = "${{ matrix.path }}";
+            const file = `${path}/plan.txt`;
+
+            let out = "No plan output found.";
+            if (fs.existsSync(file)) out = fs.readFileSync(file, "utf8");
+
+            // GitHub comment limit ~65k chars. Truncate.
+            const limit = 60000;
+            if (out.length > limit) out = out.slice(0, limit) + "\n...\n(truncated)";
+
+            const body =
+`### Terraform plan — \`${path}\`
+
+\`\`\`
+${out}
+\`\`\`
+`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body
+            });
+
+      - name: Comment apply output on PR
+        if: ${{ needs.dispatch.outputs.action == 'apply' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const prNumber = context.payload.issue.number;
+            const path = "${{ matrix.path }}";
+            const file = `${path}/apply.txt`;
+
+            let out = "No apply output found.";
+            if (fs.existsSync(file)) out = fs.readFileSync(file, "utf8");
+
+            const limit = 60000;
+            if (out.length > limit) out = out.slice(0, limit) + "\n...\n(truncated)";
+
+            const body =
+`### Terraform apply — \`${path}\`
+
+\`\`\`
+${out}
+\`\`\`
+`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body
+            });
+
+      # ---- Always post a short status summary ----
+      - name: Comment result summary on PR
         if: always()
         uses: actions/github-script@v7
         with:
