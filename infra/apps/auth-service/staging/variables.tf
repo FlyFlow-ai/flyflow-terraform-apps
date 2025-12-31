@@ -1,4 +1,4 @@
 locals {
-  name = "auth-service"
+  name    = "auth-service"
   db_name = "flyflow-infra"
 }

@@ -5,7 +5,7 @@ resource "random_password" "postgres_password" {
 }
 
 module "db" {
-  source = "app.terraform.io/FlyFlow/ec2/aws"
+  source  = "app.terraform.io/FlyFlow/ec2/aws"
   version = "~> 1.1.1"
 
 
@@ -17,7 +17,7 @@ module "db" {
   cluster_name  = "flyflow-database"
 
   # optional
-  ami_id = "ami-053e7be1410d7eb72"
+  ami_id    = "ami-053e7be1410d7eb72"
   user_data = <<-EOF
               #!/bin/bash
               sudo apt-get update
