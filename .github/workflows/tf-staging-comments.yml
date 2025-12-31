@@ -1,0 +1,222 @@
+name: Terraform PR comments (staging only)
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  dispatch:
+    if: |
+      github.event.issue.pull_request &&
+      (startsWith(github.event.comment.body, '/tf plan') || startsWith(github.event.comment.body, '/tf apply'))
+    runs-on: ubuntu-latest
+
+    outputs:
+      action: ${{ steps.parse.outputs.action }}
+      base_ref: ${{ steps.pr.outputs.base_ref }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      is_fork: ${{ steps.pr.outputs.is_fork }}
+      matrix: ${{ steps.targets.outputs.matrix }}
+      actor_ok: ${{ steps.perms.outputs.actor_ok }}
+
+    steps:
+      - name: Parse comment
+        id: parse
+        run: |
+          BODY="${{ github.event.comment.body }}"
+          # Normalize whitespace
+          BODY="$(echo "$BODY" | tr -s ' ')"
+
+          if [[ "$BODY" =~ ^/tf[[:space:]]+plan($|[[:space:]].*) ]]; then
+            echo "action=plan" >> $GITHUB_OUTPUT
+          elif [[ "$BODY" =~ ^/tf[[:space:]]+apply($|[[:space:]].*) ]]; then
+            echo "action=apply" >> $GITHUB_OUTPUT
+          else
+            echo "action=unknown" >> $GITHUB_OUTPUT
+          fi
+
+          # optional argument: app name or explicit path
+          ARG="$(echo "$BODY" | awk '{print $3}')"
+          echo "arg=$ARG" >> $GITHUB_OUTPUT
+
+      - name: Fetch PR details
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.issue.number;
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            core.setOutput("base_ref", pr.data.base.ref);
+            core.setOutput("head_sha", pr.data.head.sha);
+            core.setOutput("is_fork", String(pr.data.head.repo.fork));
+
+      - name: Check commenter permission (write/maintain/admin required for apply)
+        id: perms
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const actor = context.actor;
+            const { owner, repo } = context.repo;
+
+            const perm = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner, repo, username: actor
+            });
+
+            const level = perm.data.permission; // admin, maintain, write, triage, read, none
+            const ok = ["admin", "maintain", "write"].includes(level);
+            core.setOutput("actor_ok", String(ok));
+
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 0
+
+      - name: Compute target roots (staging only)
+        id: targets
+        run: |
+          ACTION="${{ steps.parse.outputs.action }}"
+          ARG="${{ steps.parse.outputs.arg }}"
+          BASE_REF="${{ steps.pr.outputs.base_ref }}"
+
+          # Fetch base branch to diff (for /tf plan with no arg)
+          git fetch origin "${BASE_REF}:${BASE_REF}" --depth=1 || true
+
+          TARGETS=""
+
+          if [ -n "$ARG" ]; then
+            # If ARG looks like a path, use it; else treat as <app>
+            if [[ "$ARG" == infra/apps/* ]]; then
+              CAND="$ARG"
+            else
+              CAND="infra/apps/$ARG/staging"
+            fi
+
+            # Enforce staging only
+            if [[ "$CAND" != */staging ]]; then
+              echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
+              echo "error=Only staging is allowed. Use infra/apps/<app>/staging or '/tf plan <app>'." >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            if [ ! -d "$CAND" ]; then
+              echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
+              echo "error=Target not found: $CAND" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            TARGETS="$CAND"
+          else
+            # No ARG: plan/apply only changed staging roots
+            # Compare base...HEAD
+            CHANGED=$(git diff --name-only "${BASE_REF}...HEAD" | grep '^infra/apps/' || true)
+
+            ROOTS=$(echo "$CHANGED" \
+              | awk -F/ 'NF>=4 {print $1"/"$2"/"$3"/"$4}' \
+              | sort -u \
+              | grep '/staging$' || true)
+
+            TARGETS="$ROOTS"
+          fi
+
+          if [ -z "$TARGETS" ]; then
+            echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          JSON=$(echo "$TARGETS" | awk '{print "{\"path\":\""$0"\"}"}' | paste -sd, -)
+          echo "matrix={\"include\":[${JSON}]}" >> $GITHUB_OUTPUT
+
+  terraform:
+    needs: dispatch
+    if: ${{ fromJson(needs.dispatch.outputs.matrix).include[0] != null }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.dispatch.outputs.matrix) }}
+
+    # prevent two applies/plan collisions for same target
+    concurrency:
+      group: tf-staging-${{ matrix.path }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.dispatch.outputs.head_sha }}
+          fetch-depth: 0
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      # Recommended: AWS OIDC role for GitHub Actions
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Init
+        run: |
+          # If your backend.hcl has "profile=...", create backend.ci.hcl without it and use that here.
+          terraform -chdir=${{ matrix.path }} init -backend-config=backend.hcl
+
+      - name: Validate
+        run: |
+          terraform -chdir=${{ matrix.path }} fmt -check -recursive
+          terraform -chdir=${{ matrix.path }} validate
+
+      - name: Plan
+        if: ${{ needs.dispatch.outputs.action == 'plan' }}
+        run: |
+          terraform -chdir=${{ matrix.path }} plan -no-color | tee plan.txt
+
+      - name: Apply (staging only)
+        if: ${{ needs.dispatch.outputs.action == 'apply' }}
+        run: |
+          # safety gates
+          if [ "${{ needs.dispatch.outputs.is_fork }}" = "true" ]; then
+            echo "Refusing apply: PR is from a fork."
+            exit 1
+          fi
+          if [ "${{ needs.dispatch.outputs.actor_ok }}" != "true" ]; then
+            echo "Refusing apply: commenter lacks write/maintain/admin permission."
+            exit 1
+          fi
+
+          terraform -chdir=${{ matrix.path }} apply -auto-approve
+
+      - name: Comment result on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.issue.number;
+            const action = "${{ needs.dispatch.outputs.action }}";
+            const path = "${{ matrix.path }}";
+            const ok = "${{ job.status }}" === "success";
+
+            const body = ok
+              ? `✅ Terraform **${action}** succeeded for \`${path}\``
+              : `❌ Terraform **${action}** failed for \`${path}\` (check workflow logs)`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body
+            });
