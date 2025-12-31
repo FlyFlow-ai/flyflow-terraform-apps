@@ -72,7 +72,7 @@ jobs:
               owner, repo, username: actor
             });
 
-            const level = perm.data.permission;
+            const level = perm.data.permission; // admin, maintain, write, triage, read, none
             const ok = ["admin", "maintain", "write"].includes(level);
             core.setOutput("actor_ok", String(ok));
 
@@ -88,17 +88,20 @@ jobs:
           ARG="${{ steps.parse.outputs.arg }}"
           BASE_REF="${{ steps.pr.outputs.base_ref }}"
 
+          # Fetch base branch ref for diff
           git fetch origin "${BASE_REF}:${BASE_REF}" --depth=1 || true
 
           TARGETS=""
 
           if [ -n "$ARG" ]; then
+            # If ARG looks like a path, use it; else treat as <app>
             if [[ "$ARG" == infra/apps/* ]]; then
               CAND="$ARG"
             else
               CAND="infra/apps/$ARG/staging"
             fi
 
+            # Enforce staging only
             if [[ "$CAND" != */staging ]]; then
               echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
               echo "error=Only staging is allowed. Use infra/apps/<app>/staging or '/tf plan <app>'." >> $GITHUB_OUTPUT
@@ -113,6 +116,7 @@ jobs:
 
             TARGETS="$CAND"
           else
+            # No ARG: plan/apply only changed staging roots under infra/apps/**/**.
             CHANGED=$(git diff --name-only "${BASE_REF}...HEAD" | grep '^infra/apps/' || true)
 
             ROOTS=$(echo "$CHANGED" \
@@ -131,20 +135,19 @@ jobs:
           JSON=$(echo "$TARGETS" | awk '{print "{\"path\":\""$0"\"}"}' | paste -sd, -)
           echo "matrix={\"include\":[${JSON}]}" >> $GITHUB_OUTPUT
 
-      # Optional: if you want to comment when detection failed / no targets
-      - name: Comment dispatch error (optional)
+      - name: Comment dispatch error (if any)
         if: ${{ steps.targets.outputs.error != '' }}
         uses: actions/github-script@v7
         with:
           script: |
+            const prNumber = context.payload.issue.number;
+            const msg = "${{ steps.targets.outputs.error }}";
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.payload.issue.number,
-              body: `⚠️ ${process.env.ERR}`
+              issue_number: prNumber,
+              body: `⚠️ ${msg}`
             });
-        env:
-          ERR: ${{ steps.targets.outputs.error }}
 
   terraform:
     needs: dispatch
@@ -154,6 +157,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.dispatch.outputs.matrix) }}
 
+    # prevent collisions per target
     concurrency:
       group: tf-staging-${{ matrix.path }}
       cancel-in-progress: false
@@ -193,6 +197,7 @@ jobs:
       - name: Apply (staging only)
         if: ${{ needs.dispatch.outputs.action == 'apply' }}
         run: |
+          # safety gates
           if [ "${{ needs.dispatch.outputs.is_fork }}" = "true" ]; then
             echo "Refusing apply: PR is from a fork."
             exit 1
@@ -203,8 +208,6 @@ jobs:
           fi
 
           terraform -chdir=${{ matrix.path }} apply -auto-approve -no-color | tee ${{ matrix.path }}/apply.txt
-
-      # ---- PR COMMENTS: print plan/apply output ----
 
       - name: Comment plan output on PR
         if: ${{ needs.dispatch.outputs.action == 'plan' }}
@@ -219,17 +222,16 @@ jobs:
             let out = "No plan output found.";
             if (fs.existsSync(file)) out = fs.readFileSync(file, "utf8");
 
-            // GitHub comment limit ~65k chars. Truncate.
             const limit = 60000;
             if (out.length > limit) out = out.slice(0, limit) + "\n...\n(truncated)";
 
-            const body =
-`### Terraform plan — \`${path}\`
-
-\`\`\`
-${out}
-\`\`\`
-`;
+            const body = [
+              "### Terraform plan — `" + path + "`",
+              "",
+              "```",
+              out,
+              "```"
+            ].join("\n");
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
@@ -254,13 +256,13 @@ ${out}
             const limit = 60000;
             if (out.length > limit) out = out.slice(0, limit) + "\n...\n(truncated)";
 
-            const body =
-`### Terraform apply — \`${path}\`
-
-\`\`\`
-${out}
-\`\`\`
-`;
+            const body = [
+              "### Terraform apply — `" + path + "`",
+              "",
+              "```",
+              out,
+              "```"
+            ].join("\n");
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
@@ -269,7 +271,6 @@ ${out}
               body
             });
 
-      # ---- Always post a short status summary ----
       - name: Comment result summary on PR
         if: always()
         uses: actions/github-script@v7
