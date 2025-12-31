@@ -167,6 +167,8 @@ jobs:
     needs: dispatch
     if: ${{ fromJson(needs.dispatch.outputs.matrix).include[0] != null }}
     runs-on: ubuntu-latest
+    env:
+      TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.dispatch.outputs.matrix) }}
