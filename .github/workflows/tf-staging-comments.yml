@@ -19,7 +19,6 @@ jobs:
 
     outputs:
       action: ${{ steps.parse.outputs.action }}
-      base_ref: ${{ steps.pr.outputs.base_ref }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
       is_fork: ${{ steps.pr.outputs.is_fork }}
       matrix: ${{ steps.targets.outputs.matrix }}
@@ -56,7 +55,6 @@ jobs:
               pull_number: prNumber,
             });
 
-            core.setOutput("base_ref", pr.data.base.ref);
             core.setOutput("head_sha", pr.data.head.sha);
             core.setOutput("is_fork", String(pr.data.head.repo.fork));
 
@@ -76,64 +74,67 @@ jobs:
             const ok = ["admin", "maintain", "write"].includes(level);
             core.setOutput("actor_ok", String(ok));
 
-      - name: Checkout PR head
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.pr.outputs.head_sha }}
-          fetch-depth: 0
-
-      - name: Compute target roots (staging only)
+      - name: Compute target roots (staging only) - via GitHub API
         id: targets
-        run: |
-          ARG="${{ steps.parse.outputs.arg }}"
-          BASE_REF="${{ steps.pr.outputs.base_ref }}"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.issue.number;
+            const body = (context.payload.comment.body || "").trim().replace(/\s+/g, " ");
+            const parts = body.split(" ");
+            const arg = parts[2] || "";
 
-          # Fetch base branch ref for diff
-          git fetch origin "${BASE_REF}:${BASE_REF}" --depth=1 || true
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
 
-          TARGETS=""
+            // Helper: build terraform root path from a file path: infra/apps/<app>/<env>
+            function rootFromFilename(filename) {
+              if (!filename.startsWith("infra/apps/")) return null;
+              const seg = filename.split("/");
+              if (seg.length < 4) return null;
+              return seg.slice(0, 4).join("/");
+            }
 
-          if [ -n "$ARG" ]; then
-            # If ARG looks like a path, use it; else treat as <app>
-            if [[ "$ARG" == infra/apps/* ]]; then
-              CAND="$ARG"
-            else
-              CAND="infra/apps/$ARG/staging"
-            fi
+            // If user specified an app or a path: /tf plan payments  OR /tf plan infra/apps/payments/staging
+            if (arg) {
+              const cand = arg.startsWith("infra/apps/") ? arg : `infra/apps/${arg}/staging`;
 
-            # Enforce staging only
-            if [[ "$CAND" != */staging ]]; then
-              echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
-              echo "error=Only staging is allowed. Use infra/apps/<app>/staging or '/tf plan <app>'." >> $GITHUB_OUTPUT
-              exit 0
-            fi
+              if (!cand.endsWith("/staging")) {
+                core.setOutput("matrix", JSON.stringify({ include: [] }));
+                core.setOutput("error", "Only staging is allowed. Use infra/apps/<app>/staging or '/tf plan <app>'.");
+                return;
+              }
 
-            if [ ! -d "$CAND" ]; then
-              echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
-              echo "error=Target not found: $CAND" >> $GITHUB_OUTPUT
-              exit 0
-            fi
+              core.setOutput("matrix", JSON.stringify({ include: [{ path: cand }] }));
+              return;
+            }
 
-            TARGETS="$CAND"
-          else
-            # No ARG: plan/apply only changed staging roots under infra/apps/**/**.
-            CHANGED=$(git diff --name-only "${BASE_REF}...HEAD" | grep '^infra/apps/' || true)
+            // Otherwise: derive from changed files in the PR
+            const roots = new Set();
 
-            ROOTS=$(echo "$CHANGED" \
-              | awk -F/ 'NF>=4 {print $1"/"$2"/"$3"/"$4}' \
-              | sort -u \
-              | grep '/staging$' || true)
+            let page = 1;
+            const per_page = 100;
 
-            TARGETS="$ROOTS"
-          fi
+            while (true) {
+              const res = await github.rest.pulls.listFiles({
+                owner,
+                repo,
+                pull_number: prNumber,
+                per_page,
+                page
+              });
 
-          if [ -z "$TARGETS" ]; then
-            echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+              for (const f of res.data) {
+                const r = rootFromFilename(f.filename);
+                if (r && r.endsWith("/staging")) roots.add(r);
+              }
 
-          JSON=$(echo "$TARGETS" | awk '{print "{\"path\":\""$0"\"}"}' | paste -sd, -)
-          echo "matrix={\"include\":[${JSON}]}" >> $GITHUB_OUTPUT
+              if (res.data.length < per_page) break;
+              page += 1;
+            }
+
+            const include = Array.from(roots).sort().map(p => ({ path: p }));
+            core.setOutput("matrix", JSON.stringify({ include }));
 
       - name: Comment dispatch error (if any)
         if: ${{ steps.targets.outputs.error != '' }}
@@ -149,6 +150,19 @@ jobs:
               body: `⚠️ ${msg}`
             });
 
+      - name: Comment when nothing to run
+        if: ${{ steps.targets.outputs.matrix == '{"include":[]}' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.issue.number;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: "ℹ️ No changed **staging** Terraform roots detected under `infra/apps/**/staging`. Use `/tf plan <app>` to force one."
+            });
+
   terraform:
     needs: dispatch
     if: ${{ fromJson(needs.dispatch.outputs.matrix).include[0] != null }}
@@ -157,7 +171,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.dispatch.outputs.matrix) }}
 
-    # prevent collisions per target
     concurrency:
       group: tf-staging-${{ matrix.path }}
       cancel-in-progress: false
@@ -197,7 +210,6 @@ jobs:
       - name: Apply (staging only)
         if: ${{ needs.dispatch.outputs.action == 'apply' }}
         run: |
-          # safety gates
           if [ "${{ needs.dispatch.outputs.is_fork }}" = "true" ]; then
             echo "Refusing apply: PR is from a fork."
             exit 1
@@ -214,7 +226,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const fs = require('fs');
+            const fs = require("fs");
             const prNumber = context.payload.issue.number;
             const path = "${{ matrix.path }}";
             const file = `${path}/plan.txt`;
@@ -245,7 +257,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const fs = require('fs');
+            const fs = require("fs");
             const prNumber = context.payload.issue.number;
             const path = "${{ matrix.path }}";
             const file = `${path}/apply.txt`;
